@@ -5,9 +5,15 @@ import { mapWithConcurrency, sleep } from "./pool";
 
 const API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const METADATA_HEADERS = ["From", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post"];
-// Gmail allows 250 quota units per user per second; messages.get costs 5.
-const CONCURRENCY = 8;
+// Gmail allows 250 quota units per user per second, and messages.get/trash cost 5,
+// so at most ~50 calls a second. We start one request every 30 ms (~33/s) to stay
+// safely under it, and keep a few in flight to hide network latency.
+const CONCURRENCY = 6;
+const MIN_REQUEST_GAP_MS = 30;
+const MAX_RETRIES = 6;
 const LIST_PAGE_SIZE = 500;
+// Gmail reports per-user rate limits as 429 *or* as 403 with one of these reasons.
+const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded"]);
 
 export class AuthExpiredError extends Error {
   constructor() {
@@ -41,6 +47,8 @@ interface MessageResponse {
 export class GmailService implements MailService {
   readonly isDemo = false;
   private readonly accessToken: string;
+  /** Earliest time the next request may start (simple client-side rate limiter). */
+  private nextRequestAt = 0;
 
   constructor(accessToken: string) {
     this.accessToken = accessToken;
@@ -166,14 +174,24 @@ export class GmailService implements MailService {
         listUnsubscribePost: headers.get("list-unsubscribe-post"),
       };
     } catch (error) {
-      // A message deleted while we were scanning is simply skipped.
-      if (error instanceof GmailApiError && error.status === 404) return null;
+      // A message that was deleted mid-scan, or that keeps failing after all
+      // retries, is skipped so one bad message never sinks the whole scan.
+      if (error instanceof GmailApiError) return null;
       throw error;
     }
   }
 
+  /** Waits for this request's turn so we never burst past Gmail's per-user quota. */
+  private async throttle(): Promise<void> {
+    const now = Date.now();
+    const startAt = Math.max(now, this.nextRequestAt);
+    this.nextRequestAt = startAt + MIN_REQUEST_GAP_MS;
+    if (startAt > now) await sleep(startAt - now);
+  }
+
   /** Calls the Gmail API, retrying rate limits and server errors with backoff. */
   private async request<T = unknown>(path: string, init: RequestInit = {}, attempt = 0): Promise<T> {
+    await this.throttle();
     const response = await fetch(`${API}${path}`, {
       ...init,
       headers: {
@@ -189,19 +207,39 @@ export class GmailService implements MailService {
     }
     if (response.status === 401) throw new AuthExpiredError();
 
-    const retryable = response.status === 429 || response.status >= 500;
-    if (retryable && attempt < 4) {
-      await sleep(2 ** attempt * 1000 + Math.random() * 500);
+    const error = await readError(response);
+    if (isRetryable(response.status, error.reasons) && attempt < MAX_RETRIES) {
+      // Exponential backoff with jitter: ~1s, 2s, 4s… capped at 30s, or what Gmail asks for.
+      const retryAfter = Number(response.headers.get("Retry-After")) * 1000;
+      const backoff = Math.min(2 ** attempt * 1000, 30_000) + Math.random() * 500;
+      await sleep(retryAfter > 0 ? retryAfter : backoff);
       return this.request<T>(path, init, attempt + 1);
     }
-
-    let message = `Gmail request failed (${response.status})`;
-    try {
-      const body = (await response.json()) as { error?: { message?: string } };
-      if (body.error?.message) message = body.error.message;
-    } catch {
-      // Keep the generic message.
-    }
-    throw new GmailApiError(response.status, message);
+    throw new GmailApiError(response.status, error.message);
   }
+}
+
+interface ApiError {
+  message: string;
+  reasons: string[];
+}
+
+async function readError(response: Response): Promise<ApiError> {
+  const fallback = `Gmail request failed (${response.status})`;
+  try {
+    const body = (await response.json()) as {
+      error?: { message?: string; errors?: { reason?: string }[] };
+    };
+    return {
+      message: body.error?.message || fallback,
+      reasons: (body.error?.errors ?? []).map((e) => e.reason ?? ""),
+    };
+  } catch {
+    return { message: fallback, reasons: [] };
+  }
+}
+
+export function isRetryable(status: number, reasons: string[]): boolean {
+  if (status === 429 || status >= 500) return true;
+  return status === 403 && reasons.some((r) => RATE_LIMIT_REASONS.has(r));
 }

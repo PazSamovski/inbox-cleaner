@@ -56,7 +56,8 @@ export function useCleaner() {
   const toast = useCallback((kind: Toast["kind"], text: string) => {
     const id = ++toastId.current;
     setToasts((t) => [...t, { id, kind, text }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
+    // Errors stay longer so there is time to read them.
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === "error" ? 15000 : 6000);
   }, []);
 
   const dismissToast = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
