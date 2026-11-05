@@ -11,12 +11,20 @@ export async function mapWithConcurrency<T, R>(
   const results = new Array<R>(items.length);
   let next = 0;
   let done = 0;
+  // Once any item fails, the other runners stop picking up work and stop
+  // reporting progress, so the caller never sees progress after a failure.
+  let failed = false;
 
   async function run(): Promise<void> {
-    while (next < items.length) {
+    while (!failed && next < items.length) {
       const index = next++;
-      results[index] = await worker(items[index], index);
-      onItemDone?.(++done);
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+      if (!failed) onItemDone?.(++done);
     }
   }
 
